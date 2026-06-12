@@ -13,6 +13,7 @@ import {
   Settings,
   ChevronLeft,
   Zap,
+  CalendarDays,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useState } from "react";
@@ -38,6 +39,7 @@ const NAV_ITEMS = [
     section: "Billing",
     items: [
       { href: "/billing", label: "Billing Workspace", icon: Receipt },
+      { href: "/billing/periods", label: "Billing Periods", icon: CalendarDays },
       { href: "/approvals", label: "Approvals", icon: CheckSquare },
     ],
   },

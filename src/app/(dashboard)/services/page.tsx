@@ -14,7 +14,8 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
-import { Plus, Grid3X3 } from "lucide-react";
+import { Plus, Grid3X3, ExternalLink } from "lucide-react";
+import { useRouter } from "next/navigation";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
@@ -40,6 +41,7 @@ const serviceSchema = z.object({
 type ServiceFormData = z.infer<typeof serviceSchema>;
 
 export default function ServicesPage() {
+  const router = useRouter();
   const [createOpen, setCreateOpen] = useState(false);
 
   const { data: services, isLoading, refetch } = trpc.services.list.useQuery({ includeInactive: true });
@@ -98,7 +100,7 @@ export default function ServicesPage() {
               </TableHeader>
               <TableBody>
                 {services.map((service) => (
-                  <TableRow key={service.id}>
+                  <TableRow key={service.id} className="cursor-pointer" onClick={() => router.push(`/services/${service.id}`)}>
                     <TableCell>
                       <div>
                         <p className="font-medium">{service.name}</p>

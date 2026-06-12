@@ -534,3 +534,25 @@ export const billingRunsRelations = relations(billingRuns, ({ one, many }) => ({
   }),
   lineItems: many(billingLineItems),
 }));
+
+export const billingLineItemsRelations = relations(billingLineItems, ({ one }) => ({
+  billingRun: one(billingRuns, { fields: [billingLineItems.billingRunId], references: [billingRuns.id] }),
+  service: one(services, { fields: [billingLineItems.serviceId], references: [services.id] }),
+}));
+
+export const approvalInstancesRelations = relations(approvalInstances, ({ one, many }) => ({
+  tenant: one(tenants, { fields: [approvalInstances.tenantId], references: [tenants.id] }),
+  workflowDefinition: one(workflowDefinitions, {
+    fields: [approvalInstances.workflowDefinitionId],
+    references: [workflowDefinitions.id],
+  }),
+  steps: many(approvalSteps),
+}));
+
+export const approvalStepsRelations = relations(approvalSteps, ({ one }) => ({
+  approvalInstance: one(approvalInstances, {
+    fields: [approvalSteps.approvalInstanceId],
+    references: [approvalInstances.id],
+  }),
+  approver: one(users, { fields: [approvalSteps.approverId], references: [users.id] }),
+}));

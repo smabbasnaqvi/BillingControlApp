@@ -1,8 +1,9 @@
 import { z } from "zod";
 import { router, protectedProcedure } from "../trpc";
-import { billingPeriods, billingRuns, billingLineItems } from "@/db/schema";
-import { eq, and, desc, isNull } from "drizzle-orm";
+import { billingPeriods, billingRuns, billingLineItems, contracts, contractLineItems, users } from "@/db/schema";
+import { eq, and, desc, isNull, sql } from "drizzle-orm";
 import { TRPCError } from "@trpc/server";
+import { sendApprovalRequestEmail, sendApprovalDecisionEmail } from "@/lib/notifications";
 
 export const billingRouter = router({
   // ── Billing Periods ──────────────────────────────────────────────────────
@@ -13,6 +14,16 @@ export const billingRouter = router({
       orderBy: [desc(billingPeriods.periodStart)],
     });
   }),
+
+  getPeriodById: protectedProcedure
+    .input(z.object({ id: z.string().uuid() }))
+    .query(async ({ ctx, input }) => {
+      const period = await ctx.db.query.billingPeriods.findFirst({
+        where: and(eq(billingPeriods.id, input.id), eq(billingPeriods.tenantId, ctx.tenant.id)),
+      });
+      if (!period) throw new TRPCError({ code: "NOT_FOUND" });
+      return period;
+    }),
 
   createPeriod: protectedProcedure
     .input(
@@ -33,9 +44,36 @@ export const billingRouter = router({
   lockPeriod: protectedProcedure
     .input(z.object({ id: z.string().uuid() }))
     .mutation(async ({ ctx, input }) => {
+      // Ensure all runs in this period are approved before locking
+      const pendingRuns = await ctx.db.query.billingRuns.findMany({
+        where: and(
+          eq(billingRuns.billingPeriodId, input.id),
+          eq(billingRuns.tenantId, ctx.tenant.id)
+        ),
+      });
+      const hasUnfinished = pendingRuns.some(
+        (r) => !["approved", "invoiced", "voided"].includes(r.status)
+      );
+      if (hasUnfinished) {
+        throw new TRPCError({
+          code: "PRECONDITION_FAILED",
+          message: "All billing runs must be approved before locking the period.",
+        });
+      }
       const [updated] = await ctx.db
         .update(billingPeriods)
         .set({ status: "locked", lockedAt: new Date(), lockedBy: ctx.user.id })
+        .where(and(eq(billingPeriods.id, input.id), eq(billingPeriods.tenantId, ctx.tenant.id)))
+        .returning();
+      return updated;
+    }),
+
+  closePeriod: protectedProcedure
+    .input(z.object({ id: z.string().uuid() }))
+    .mutation(async ({ ctx, input }) => {
+      const [updated] = await ctx.db
+        .update(billingPeriods)
+        .set({ status: "closed", updatedAt: new Date() })
         .where(and(eq(billingPeriods.id, input.id), eq(billingPeriods.tenantId, ctx.tenant.id)))
         .returning();
       return updated;
@@ -59,20 +97,14 @@ export const billingRouter = router({
       const results = await ctx.db.query.billingRuns.findMany({
         where: and(
           eq(billingRuns.tenantId, ctx.tenant.id),
-          input.billingPeriodId
-            ? eq(billingRuns.billingPeriodId, input.billingPeriodId)
-            : undefined,
+          input.billingPeriodId ? eq(billingRuns.billingPeriodId, input.billingPeriodId) : undefined,
           input.customerId ? eq(billingRuns.customerId, input.customerId) : undefined,
           input.status !== "all" ? eq(billingRuns.status, input.status) : undefined
         ),
         orderBy: [desc(billingRuns.createdAt)],
         limit: input.limit,
         offset: input.offset,
-        with: {
-          customer: true,
-          billingPeriod: true,
-          lineItems: true,
-        },
+        with: { customer: true, billingPeriod: true, lineItems: true },
       });
       return results;
     }),
@@ -81,20 +113,253 @@ export const billingRouter = router({
     .input(z.object({ id: z.string().uuid() }))
     .query(async ({ ctx, input }) => {
       const run = await ctx.db.query.billingRuns.findFirst({
-        where: and(
-          eq(billingRuns.id, input.id),
-          eq(billingRuns.tenantId, ctx.tenant.id)
-        ),
+        where: and(eq(billingRuns.id, input.id), eq(billingRuns.tenantId, ctx.tenant.id)),
         with: {
           customer: true,
           billingPeriod: true,
-          contract: { with: { lineItems: { with: { service: true } } } },
-          lineItems: { with: { service: true } },
+          contract: { with: { lineItems: { orderBy: (li, { asc }) => [asc(li.sortOrder)], with: { service: true } } } },
+          lineItems: {
+            where: eq(billingLineItems.isVoided, false),
+            orderBy: [billingLineItems.createdAt],
+            with: { service: true },
+          },
         },
       });
-
       if (!run) throw new TRPCError({ code: "NOT_FOUND" });
       return run;
+    }),
+
+  // ── Auto-generate from contract (fixed billing) ──────────────────────────
+
+  generateFromContract: protectedProcedure
+    .input(
+      z.object({
+        contractId: z.string().uuid(),
+        billingPeriodId: z.string().uuid(),
+        currency: z.string().default("USD"),
+      })
+    )
+    .mutation(async ({ ctx, input }) => {
+      const contract = await ctx.db.query.contracts.findFirst({
+        where: and(
+          eq(contracts.id, input.contractId),
+          eq(contracts.tenantId, ctx.tenant.id),
+          isNull(contracts.deletedAt)
+        ),
+        with: { lineItems: { with: { service: true } }, customer: true },
+      });
+
+      if (!contract) throw new TRPCError({ code: "NOT_FOUND", message: "Contract not found" });
+      if (contract.status !== "active") {
+        throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Contract must be active to generate billing" });
+      }
+
+      // Check for duplicate run for this period + contract
+      const existing = await ctx.db.query.billingRuns.findFirst({
+        where: and(
+          eq(billingRuns.contractId, input.contractId),
+          eq(billingRuns.billingPeriodId, input.billingPeriodId),
+          eq(billingRuns.tenantId, ctx.tenant.id)
+        ),
+      });
+      if (existing) {
+        throw new TRPCError({ code: "CONFLICT", message: "A billing run already exists for this contract and period" });
+      }
+
+      // Only include monthly/applicable line items for this period
+      const applicableLineItems = contract.lineItems.filter(
+        (li) => li.billingFrequency === "monthly" || li.billingFrequency === "one_time"
+      );
+
+      const totalAmount = applicableLineItems
+        .reduce((sum, li) => sum + parseFloat(li.unitPrice), 0)
+        .toFixed(2);
+
+      const [run] = await ctx.db
+        .insert(billingRuns)
+        .values({
+          tenantId: ctx.tenant.id,
+          billingPeriodId: input.billingPeriodId,
+          customerId: contract.customerId,
+          contractId: input.contractId,
+          currency: input.currency,
+          totalAmount,
+          status: "draft",
+          generatedBy: ctx.user.id,
+        })
+        .returning();
+
+      if (applicableLineItems.length > 0) {
+        await ctx.db.insert(billingLineItems).values(
+          applicableLineItems.map((li) => ({
+            billingRunId: run.id,
+            contractLineItemId: li.id,
+            serviceId: li.serviceId,
+            description: li.description,
+            quantity: "1",
+            unitPrice: li.unitPrice,
+            amount: li.unitPrice,
+            sourceData: { generatedFrom: "contract", contractLineItemId: li.id },
+          }))
+        );
+      }
+
+      return run;
+    }),
+
+  // ── Line Item CRUD ────────────────────────────────────────────────────────
+
+  addLineItem: protectedProcedure
+    .input(
+      z.object({
+        billingRunId: z.string().uuid(),
+        serviceId: z.string().uuid().optional(),
+        description: z.string().min(1),
+        quantity: z.string().default("1"),
+        unitPrice: z.string(),
+        lineType: z.enum(["variable", "fixed", "adjustment"]).default("variable"),
+        notes: z.string().optional(),
+      })
+    )
+    .mutation(async ({ ctx, input }) => {
+      const run = await ctx.db.query.billingRuns.findFirst({
+        where: and(eq(billingRuns.id, input.billingRunId), eq(billingRuns.tenantId, ctx.tenant.id)),
+      });
+      if (!run) throw new TRPCError({ code: "NOT_FOUND" });
+      if (!["draft"].includes(run.status)) {
+        throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Cannot edit a submitted billing run" });
+      }
+
+      const qty = parseFloat(input.quantity);
+      const price = parseFloat(input.unitPrice);
+      const amount = (qty * price).toFixed(2);
+
+      const [lineItem] = await ctx.db
+        .insert(billingLineItems)
+        .values({
+          billingRunId: input.billingRunId,
+          serviceId: input.serviceId ?? null,
+          description: input.description,
+          quantity: input.quantity,
+          unitPrice: input.unitPrice,
+          amount,
+          sourceData: { lineType: input.lineType, notes: input.notes ?? null },
+        })
+        .returning();
+
+      // Recalculate run total
+      await recalculateRunTotal(ctx.db, input.billingRunId);
+
+      return lineItem;
+    }),
+
+  updateLineItem: protectedProcedure
+    .input(
+      z.object({
+        id: z.string().uuid(),
+        billingRunId: z.string().uuid(),
+        quantity: z.string().optional(),
+        unitPrice: z.string().optional(),
+        description: z.string().optional(),
+        notes: z.string().optional(),
+      })
+    )
+    .mutation(async ({ ctx, input }) => {
+      const run = await ctx.db.query.billingRuns.findFirst({
+        where: and(eq(billingRuns.id, input.billingRunId), eq(billingRuns.tenantId, ctx.tenant.id)),
+      });
+      if (!run) throw new TRPCError({ code: "NOT_FOUND" });
+      if (!["draft"].includes(run.status)) {
+        throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Cannot edit a submitted billing run" });
+      }
+
+      const existing = await ctx.db.query.billingLineItems.findFirst({
+        where: eq(billingLineItems.id, input.id),
+      });
+      if (!existing) throw new TRPCError({ code: "NOT_FOUND" });
+
+      const qty = parseFloat(input.quantity ?? existing.quantity);
+      const price = parseFloat(input.unitPrice ?? existing.unitPrice);
+      const amount = (qty * price).toFixed(2);
+
+      const existingSource = (existing.sourceData ?? {}) as Record<string, unknown>;
+      const [updated] = await ctx.db
+        .update(billingLineItems)
+        .set({
+          quantity: input.quantity ?? existing.quantity,
+          unitPrice: input.unitPrice ?? existing.unitPrice,
+          description: input.description ?? existing.description,
+          amount,
+          sourceData: { ...existingSource, notes: input.notes ?? existingSource.notes },
+        })
+        .where(eq(billingLineItems.id, input.id))
+        .returning();
+
+      await recalculateRunTotal(ctx.db, input.billingRunId);
+
+      return updated;
+    }),
+
+  voidLineItem: protectedProcedure
+    .input(z.object({ id: z.string().uuid(), billingRunId: z.string().uuid() }))
+    .mutation(async ({ ctx, input }) => {
+      const run = await ctx.db.query.billingRuns.findFirst({
+        where: and(eq(billingRuns.id, input.billingRunId), eq(billingRuns.tenantId, ctx.tenant.id)),
+      });
+      if (!run) throw new TRPCError({ code: "NOT_FOUND" });
+      if (!["draft"].includes(run.status)) {
+        throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Cannot void a line item in a submitted run" });
+      }
+
+      await ctx.db
+        .update(billingLineItems)
+        .set({ isVoided: true })
+        .where(eq(billingLineItems.id, input.id));
+
+      await recalculateRunTotal(ctx.db, input.billingRunId);
+
+      return { success: true };
+    }),
+
+  addAdjustment: protectedProcedure
+    .input(
+      z.object({
+        billingRunId: z.string().uuid(),
+        description: z.string().min(1),
+        amount: z.string(),
+        type: z.enum(["credit", "debit"]),
+        reason: z.string().optional(),
+      })
+    )
+    .mutation(async ({ ctx, input }) => {
+      const run = await ctx.db.query.billingRuns.findFirst({
+        where: and(eq(billingRuns.id, input.billingRunId), eq(billingRuns.tenantId, ctx.tenant.id)),
+      });
+      if (!run) throw new TRPCError({ code: "NOT_FOUND" });
+      if (!["draft"].includes(run.status)) {
+        throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Cannot adjust a submitted billing run" });
+      }
+
+      // Credits are stored as negative amounts
+      const signedAmount = input.type === "credit"
+        ? (-Math.abs(parseFloat(input.amount))).toFixed(2)
+        : Math.abs(parseFloat(input.amount)).toFixed(2);
+
+      const [adjustment] = await ctx.db
+        .insert(billingLineItems)
+        .values({
+          billingRunId: input.billingRunId,
+          description: input.description,
+          quantity: "1",
+          unitPrice: signedAmount,
+          amount: signedAmount,
+          sourceData: { lineType: "adjustment", adjustmentType: input.type, reason: input.reason ?? null },
+        })
+        .returning();
+
+      await recalculateRunTotal(ctx.db, input.billingRunId);
+
+      return adjustment;
     }),
 
   createRun: protectedProcedure
@@ -120,7 +385,6 @@ export const billingRouter = router({
     )
     .mutation(async ({ ctx, input }) => {
       const { lineItems, ...runData } = input;
-
       const totalAmount = lineItems
         .reduce((sum, li) => sum + parseFloat(li.amount), 0)
         .toFixed(2);
@@ -151,34 +415,99 @@ export const billingRouter = router({
       return run;
     }),
 
-  submitForApproval: protectedProcedure
-    .input(z.object({ id: z.string().uuid() }))
+  updateNotes: protectedProcedure
+    .input(z.object({ id: z.string().uuid(), notes: z.string() }))
     .mutation(async ({ ctx, input }) => {
+      const [updated] = await ctx.db
+        .update(billingRuns)
+        .set({ notes: input.notes, updatedAt: new Date() })
+        .where(and(eq(billingRuns.id, input.id), eq(billingRuns.tenantId, ctx.tenant.id)))
+        .returning();
+      return updated;
+    }),
+
+  submitForApproval: protectedProcedure
+    .input(z.object({ id: z.string().uuid(), approverEmail: z.string().email().optional() }))
+    .mutation(async ({ ctx, input }) => {
+      const run = await ctx.db.query.billingRuns.findFirst({
+        where: and(eq(billingRuns.id, input.id), eq(billingRuns.tenantId, ctx.tenant.id)),
+        with: { customer: true },
+      });
+      if (!run) throw new TRPCError({ code: "NOT_FOUND" });
+
       const [updated] = await ctx.db
         .update(billingRuns)
         .set({ status: "pending_approval", updatedAt: new Date() })
         .where(and(eq(billingRuns.id, input.id), eq(billingRuns.tenantId, ctx.tenant.id)))
         .returning();
+
+      // Send notification email to approver if provided
+      if (input.approverEmail) {
+        await sendApprovalRequestEmail({
+          to: input.approverEmail,
+          approverName: "Approver",
+          requesterName: ctx.user.name,
+          entityType: "billing_run",
+          entityLabel: `${run.customer.legalName} — ${run.id.slice(0, 8).toUpperCase()}`,
+          amount: parseFloat(run.totalAmount),
+          currency: run.currency,
+          approvalUrl: `${process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000"}/approvals`,
+        }).catch(console.error);
+      }
+
       return updated;
     }),
 
   approve: protectedProcedure
-    .input(z.object({ id: z.string().uuid() }))
+    .input(z.object({ id: z.string().uuid(), comments: z.string().optional(), requesterEmail: z.string().email().optional() }))
+    .mutation(async ({ ctx, input }) => {
+      const run = await ctx.db.query.billingRuns.findFirst({
+        where: and(eq(billingRuns.id, input.id), eq(billingRuns.tenantId, ctx.tenant.id)),
+        with: { customer: true },
+      });
+      if (!run) throw new TRPCError({ code: "NOT_FOUND" });
+
+      const [updated] = await ctx.db
+        .update(billingRuns)
+        .set({ status: "approved", approvedBy: ctx.user.id, approvedAt: new Date(), updatedAt: new Date() })
+        .where(and(eq(billingRuns.id, input.id), eq(billingRuns.tenantId, ctx.tenant.id)))
+        .returning();
+
+      if (input.requesterEmail) {
+        await sendApprovalDecisionEmail({
+          to: input.requesterEmail,
+          requesterName: "Team",
+          approverName: ctx.user.name,
+          decision: "approved",
+          entityLabel: `${run.customer.legalName} — ${run.id.slice(0, 8).toUpperCase()}`,
+          comments: input.comments,
+        }).catch(console.error);
+      }
+
+      return updated;
+    }),
+
+  reject: protectedProcedure
+    .input(z.object({ id: z.string().uuid(), comments: z.string().min(1, "Comments required when rejecting") }))
     .mutation(async ({ ctx, input }) => {
       const [updated] = await ctx.db
         .update(billingRuns)
-        .set({
-          status: "approved",
-          approvedBy: ctx.user.id,
-          approvedAt: new Date(),
-          updatedAt: new Date(),
-        })
+        .set({ status: "draft", updatedAt: new Date(), notes: input.comments })
         .where(and(eq(billingRuns.id, input.id), eq(billingRuns.tenantId, ctx.tenant.id)))
         .returning();
       return updated;
     }),
 
-  // ── Summary stats for dashboard ──────────────────────────────────────────
+  voidRun: protectedProcedure
+    .input(z.object({ id: z.string().uuid() }))
+    .mutation(async ({ ctx, input }) => {
+      const [updated] = await ctx.db
+        .update(billingRuns)
+        .set({ status: "voided", updatedAt: new Date() })
+        .where(and(eq(billingRuns.id, input.id), eq(billingRuns.tenantId, ctx.tenant.id)))
+        .returning();
+      return updated;
+    }),
 
   getSummaryStats: protectedProcedure.query(async ({ ctx }) => {
     const runs = await ctx.db.query.billingRuns.findMany({
@@ -194,17 +523,23 @@ export const billingRouter = router({
     currentMonth.setDate(1);
     const monthlyBilled = runs
       .filter(
-        (r) =>
-          ["approved", "invoiced"].includes(r.status) &&
-          new Date(r.createdAt) >= currentMonth
+        (r) => ["approved", "invoiced"].includes(r.status) && new Date(r.createdAt) >= currentMonth
       )
       .reduce((sum, r) => sum + parseFloat(r.totalAmount), 0);
 
-    return {
-      totalBilled,
-      monthlyBilled,
-      pendingApproval,
-      totalRuns: runs.length,
-    };
+    return { totalBilled, monthlyBilled, pendingApproval, totalRuns: runs.length };
   }),
 });
+
+// ── Helper ────────────────────────────────────────────────────────────────────
+
+async function recalculateRunTotal(db: typeof import("@/db").db, runId: string) {
+  const activeItems = await db.query.billingLineItems.findMany({
+    where: and(eq(billingLineItems.billingRunId, runId), eq(billingLineItems.isVoided, false)),
+  });
+  const total = activeItems.reduce((sum, li) => sum + parseFloat(li.amount), 0).toFixed(2);
+  await db
+    .update(billingRuns)
+    .set({ totalAmount: total, updatedAt: new Date() })
+    .where(eq(billingRuns.id, runId));
+}

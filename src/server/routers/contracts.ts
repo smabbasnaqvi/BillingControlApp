@@ -183,4 +183,95 @@ export const contractsRouter = router({
         (c) => c.expiryDate && new Date(c.expiryDate) <= futureDate
       );
     }),
+
+  // ── Amendment (creates new version, preserving history) ──────────────────
+
+  amend: protectedProcedure
+    .input(
+      z.object({
+        id: z.string().uuid(),
+        effectiveDate: z.string(),
+        expiryDate: z.string().optional(),
+        notes: z.string().optional(),
+        lineItems: z.array(
+          z.object({
+            serviceId: z.string().uuid(),
+            description: z.string().min(1),
+            unitPrice: z.string(),
+            billingFrequency: z.enum(["monthly", "quarterly", "annually", "one_time"]),
+            sortOrder: z.number().default(0),
+          })
+        ).min(1),
+      })
+    )
+    .mutation(async ({ ctx, input }) => {
+      const original = await ctx.db.query.contracts.findFirst({
+        where: and(
+          eq(contracts.id, input.id),
+          eq(contracts.tenantId, ctx.tenant.id),
+          isNull(contracts.deletedAt)
+        ),
+        with: { lineItems: true },
+      });
+
+      if (!original) throw new TRPCError({ code: "NOT_FOUND" });
+      if (!["active", "draft"].includes(original.status)) {
+        throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Only active or draft contracts can be amended" });
+      }
+
+      // Terminate the original
+      await ctx.db
+        .update(contracts)
+        .set({ status: "terminated", updatedAt: new Date() })
+        .where(eq(contracts.id, input.id));
+
+      // Create new version
+      const { id: _id, createdAt: _c, updatedAt: _u, ...originalData } = original;
+      const [amended] = await ctx.db
+        .insert(contracts)
+        .values({
+          ...originalData,
+          effectiveDate: input.effectiveDate,
+          expiryDate: input.expiryDate ?? original.expiryDate,
+          notes: input.notes ?? original.notes,
+          version: (original.version ?? 1) + 1,
+          status: "draft",
+          parentContractId: original.id,
+          referenceNumber: `${original.referenceNumber}-A${(original.version ?? 1) + 1}`,
+          createdBy: ctx.user.id,
+          approvedBy: null,
+          approvedAt: null,
+        })
+        .returning();
+
+      // Insert new line items
+      if (input.lineItems.length > 0) {
+        await ctx.db.insert(contractLineItems).values(
+          input.lineItems.map((li) => ({ ...li, contractId: amended.id }))
+        );
+      }
+
+      return amended;
+    }),
+
+  // ── Version history ────────────────────────────────────────────────────────
+
+  getVersionHistory: protectedProcedure
+    .input(z.object({ referenceBase: z.string() }))
+    .query(async ({ ctx, input }) => {
+      return ctx.db.query.contracts.findMany({
+        where: and(
+          eq(contracts.tenantId, ctx.tenant.id),
+          isNull(contracts.deletedAt)
+        ),
+        with: { customer: true },
+        orderBy: [contracts.version],
+      }).then((all) =>
+        all.filter(
+          (c) =>
+            c.referenceNumber === input.referenceBase ||
+            c.referenceNumber.startsWith(input.referenceBase + "-A")
+        )
+      );
+    }),
 });

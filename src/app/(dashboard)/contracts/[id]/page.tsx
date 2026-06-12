@@ -10,8 +10,9 @@ import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { formatCurrency, formatDate, formatRelativeDate } from "@/lib/utils";
-import { ArrowLeft, FileText, CalendarDays } from "lucide-react";
+import { ArrowLeft, FileText, CalendarDays, History, Edit } from "lucide-react";
 import { useRouter } from "next/navigation";
+import Link from "next/link";
 import { toast } from "sonner";
 
 interface Props { params: Promise<{ id: string }> }
@@ -59,6 +60,14 @@ export default function ContractDetailPage({ params }: Props) {
             >
               Activate Contract
             </Button>
+          )}
+          {contract.status === "active" && (
+            <Link href={`/contracts/${id}/amend`}>
+              <Button size="sm" variant="outline">
+                <Edit className="h-3.5 w-3.5" />
+                Amend
+              </Button>
+            </Link>
           )}
         </PageHeader>
       </div>

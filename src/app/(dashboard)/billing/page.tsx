@@ -1,35 +1,37 @@
 "use client";
 
 import { useState } from "react";
+import { useSearchParams } from "next/navigation";
 import { trpc } from "@/lib/trpc";
 import { PageHeader } from "@/components/shared/page-header";
 import { StatusBadge } from "@/components/shared/status-badge";
 import { EmptyState } from "@/components/shared/empty-state";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Card, CardContent } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Tabs } from "@radix-ui/react-tabs";
-import { Receipt, Plus, CheckCircle, Clock, Send } from "lucide-react";
+import { Receipt, Plus, CheckCircle, Clock, ArrowRight, CalendarDays } from "lucide-react";
 import { formatCurrency, formatDate } from "@/lib/utils";
-import { toast } from "sonner";
+import { useRouter } from "next/navigation";
+import Link from "next/link";
+import { Suspense } from "react";
 
-export default function BillingPage() {
-  const [activeTab, setActiveTab] = useState<"all" | "draft" | "pending_approval" | "approved">("all");
+type RunStatus = "all" | "draft" | "pending_approval" | "approved";
+
+function BillingWorkspace() {
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const periodIdParam = searchParams.get("periodId") ?? undefined;
+  const [activeTab, setActiveTab] = useState<RunStatus>("all");
+  const [selectedPeriodId, setSelectedPeriodId] = useState<string>(periodIdParam ?? "all");
 
   const { data: periods } = trpc.billing.listPeriods.useQuery();
-  const { data: runs, isLoading, refetch } = trpc.billing.listRuns.useQuery({ status: activeTab });
+  const { data: runs, isLoading } = trpc.billing.listRuns.useQuery({
+    status: activeTab,
+    billingPeriodId: selectedPeriodId !== "all" ? selectedPeriodId : undefined,
+  });
   const { data: stats } = trpc.billing.getSummaryStats.useQuery();
-
-  const submitForApproval = trpc.billing.submitForApproval.useMutation({
-    onSuccess: () => { toast.success("Submitted for approval"); refetch(); },
-    onError: (e) => toast.error(e.message),
-  });
-
-  const approve = trpc.billing.approve.useMutation({
-    onSuccess: () => { toast.success("Billing run approved"); refetch(); },
-    onError: (e) => toast.error(e.message),
-  });
 
   const TABS = [
     { value: "all", label: "All Runs" },
@@ -41,10 +43,18 @@ export default function BillingPage() {
   return (
     <div className="space-y-5">
       <PageHeader title="Billing Workspace" description="Manage billing runs and approve charges">
-        <Button size="sm" variant="outline">
-          <Plus className="h-4 w-4" />
-          New Billing Run
-        </Button>
+        <Link href="/billing/periods">
+          <Button size="sm" variant="outline">
+            <CalendarDays className="h-4 w-4" />
+            Billing Periods
+          </Button>
+        </Link>
+        <Link href="/billing/new">
+          <Button size="sm">
+            <Plus className="h-4 w-4" />
+            New Billing Run
+          </Button>
+        </Link>
       </PageHeader>
 
       {/* Stats row */}
@@ -85,21 +95,36 @@ export default function BillingPage() {
       </div>
 
       <Card>
-        {/* Tab navigation */}
-        <div className="flex gap-0 border-b border-border px-4">
-          {TABS.map((tab) => (
-            <button
-              key={tab.value}
-              onClick={() => setActiveTab(tab.value)}
-              className={`relative px-4 py-3 text-sm font-medium transition-colors ${
-                activeTab === tab.value
-                  ? "text-foreground after:absolute after:bottom-0 after:left-0 after:right-0 after:h-0.5 after:bg-primary"
-                  : "text-muted-foreground hover:text-foreground"
-              }`}
-            >
-              {tab.label}
-            </button>
-          ))}
+        {/* Filters + tabs */}
+        <div className="flex items-center justify-between border-b border-border px-4">
+          <div className="flex gap-0">
+            {TABS.map((tab) => (
+              <button
+                key={tab.value}
+                onClick={() => setActiveTab(tab.value)}
+                className={`relative px-4 py-3 text-sm font-medium transition-colors ${
+                  activeTab === tab.value
+                    ? "text-foreground after:absolute after:bottom-0 after:left-0 after:right-0 after:h-0.5 after:bg-primary"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
+          <div className="flex items-center gap-2 py-2">
+            <Select value={selectedPeriodId} onValueChange={setSelectedPeriodId}>
+              <SelectTrigger className="h-7 w-44 text-xs">
+                <SelectValue placeholder="All periods" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All periods</SelectItem>
+                {periods?.map((p) => (
+                  <SelectItem key={p.id} value={p.id}>{p.name}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
         </div>
 
         <CardContent className="p-0">
@@ -112,65 +137,61 @@ export default function BillingPage() {
               icon={Receipt}
               title="No billing runs"
               description="Generate billing runs from active contracts to start billing your customers."
-            />
+            >
+              <Link href="/billing/new">
+                <Button size="sm"><Plus className="h-4 w-4" /> New Billing Run</Button>
+              </Link>
+            </EmptyState>
           ) : (
             <Table>
               <TableHeader>
                 <TableRow>
                   <TableHead>Customer</TableHead>
                   <TableHead>Period</TableHead>
+                  <TableHead>Lines</TableHead>
                   <TableHead>Amount</TableHead>
                   <TableHead>Status</TableHead>
                   <TableHead>Created</TableHead>
-                  <TableHead className="text-right">Actions</TableHead>
+                  <TableHead className="w-10" />
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {runs.map((run) => (
-                  <TableRow key={run.id}>
+                  <TableRow
+                    key={run.id}
+                    className="cursor-pointer"
+                    onClick={() => router.push(`/billing/${run.id}`)}
+                  >
                     <TableCell>
                       <p className="text-sm font-medium">{run.customer.legalName}</p>
+                      <p className="text-xs text-muted-foreground font-mono">{run.id.slice(0, 8).toUpperCase()}</p>
                     </TableCell>
                     <TableCell>
                       <span className="text-sm text-muted-foreground">
-                        {formatDate(run.billingPeriod.periodStart)} – {formatDate(run.billingPeriod.periodEnd)}
+                        {run.billingPeriod.name}
                       </span>
+                    </TableCell>
+                    <TableCell>
+                      <span className="text-sm">{run.lineItems.length}</span>
                     </TableCell>
                     <TableCell>
                       <span className="text-sm font-semibold tabular-nums">
                         {formatCurrency(run.totalAmount, run.currency)}
                       </span>
                     </TableCell>
-                    <TableCell>
-                      <StatusBadge status={run.status} />
-                    </TableCell>
+                    <TableCell><StatusBadge status={run.status} /></TableCell>
                     <TableCell>
                       <span className="text-sm text-muted-foreground">{formatDate(run.createdAt)}</span>
                     </TableCell>
-                    <TableCell className="text-right">
-                      <div className="flex justify-end gap-2">
-                        {run.status === "draft" && (
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            onClick={() => submitForApproval.mutate({ id: run.id })}
-                            disabled={submitForApproval.isPending}
-                          >
-                            <Send className="h-3.5 w-3.5" />
-                            Submit
-                          </Button>
-                        )}
-                        {run.status === "pending_approval" && (
-                          <Button
-                            size="sm"
-                            onClick={() => approve.mutate({ id: run.id })}
-                            disabled={approve.isPending}
-                          >
-                            <CheckCircle className="h-3.5 w-3.5" />
-                            Approve
-                          </Button>
-                        )}
-                      </div>
+                    <TableCell onClick={(e) => e.stopPropagation()}>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-7 w-7"
+                        onClick={() => router.push(`/billing/${run.id}`)}
+                      >
+                        <ArrowRight className="h-3.5 w-3.5" />
+                      </Button>
                     </TableCell>
                   </TableRow>
                 ))}
@@ -180,5 +201,13 @@ export default function BillingPage() {
         </CardContent>
       </Card>
     </div>
+  );
+}
+
+export default function BillingPage() {
+  return (
+    <Suspense>
+      <BillingWorkspace />
+    </Suspense>
   );
 }
