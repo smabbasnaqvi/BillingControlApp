@@ -8,6 +8,7 @@ import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import { useUser } from "@clerk/nextjs";
 import { Building2, Users, Shield, Bell } from "lucide-react";
+import Link from "next/link";
 
 export default function SettingsPage() {
   const { user } = useUser();
@@ -81,7 +82,9 @@ export default function SettingsPage() {
               <p className="text-sm font-medium">Audit log</p>
               <p className="text-xs text-muted-foreground">View all actions taken in your organization</p>
             </div>
-            <Button variant="outline" size="sm">View Log</Button>
+            <Button variant="outline" size="sm" asChild>
+              <Link href="/settings/audit">View Log</Link>
+            </Button>
           </div>
         </CardContent>
       </Card>

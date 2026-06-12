@@ -23,11 +23,28 @@ import {
   CartesianGrid,
   Tooltip,
   ResponsiveContainer,
+  PieChart,
+  Pie,
+  Cell,
+  Legend,
 } from "recharts";
+
+const PIE_COLORS = [
+  "hsl(243 75% 59%)",
+  "hsl(197 71% 52%)",
+  "hsl(142 71% 45%)",
+  "hsl(47 100% 50%)",
+  "hsl(30 100% 50%)",
+  "hsl(0 84% 60%)",
+];
 
 export default function DashboardPage() {
   const { data: kpis, isLoading: kpisLoading } = trpc.dashboard.getKPIs.useQuery();
   const { data: activity, isLoading: activityLoading } = trpc.dashboard.getRecentActivity.useQuery();
+  const { data: concentration, isLoading: concentrationLoading } = trpc.reports.customerConcentration.useQuery({
+    topN: 5,
+    dateRange: {},
+  });
 
   return (
     <div className="space-y-6">
@@ -128,7 +145,7 @@ export default function DashboardPage() {
           </CardContent>
         </Card>
 
-        {/* Expiring Contracts Alert */}
+        {/* Attention Required */}
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">
@@ -170,42 +187,105 @@ export default function DashboardPage() {
         </Card>
       </div>
 
-      {/* Recent Activity */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-base">Recent Billing Activity</CardTitle>
-        </CardHeader>
-        <CardContent>
-          {activityLoading ? (
-            <div className="space-y-3">
-              {Array.from({ length: 5 }).map((_, i) => (
-                <Skeleton key={i} className="h-10 w-full" />
-              ))}
-            </div>
-          ) : !activity?.length ? (
-            <p className="py-8 text-center text-sm text-muted-foreground">
-              No billing activity yet. Create a billing run to get started.
-            </p>
-          ) : (
-            <div className="divide-y divide-border">
-              {activity.map((item) => (
-                <div key={item.id} className="flex items-center justify-between py-3">
-                  <div>
-                    <p className="text-sm font-medium">{item.title}</p>
-                    <p className="text-xs text-muted-foreground">{formatDate(item.createdAt)}</p>
-                  </div>
-                  <div className="flex items-center gap-4">
-                    <span className="text-sm font-semibold tabular-nums">
-                      {formatCurrency(item.amount, item.currency)}
-                    </span>
-                    <StatusBadge status={item.status} />
-                  </div>
+      {/* Customer Concentration + Recent Activity */}
+      <div className="grid gap-6 lg:grid-cols-5">
+        {/* Customer Concentration Pie */}
+        <Card className="lg:col-span-2">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <Users className="h-4 w-4 text-muted-foreground" />
+              Revenue Concentration
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            {concentrationLoading ? (
+              <Skeleton className="h-48 w-full" />
+            ) : !concentration?.items.length ? (
+              <p className="py-8 text-center text-sm text-muted-foreground">No revenue data yet.</p>
+            ) : (
+              <>
+                <ResponsiveContainer width="100%" height={160}>
+                  <PieChart>
+                    <Pie
+                      data={concentration.items}
+                      dataKey="revenue"
+                      nameKey="name"
+                      cx="50%"
+                      cy="50%"
+                      outerRadius={65}
+                      innerRadius={35}
+                    >
+                      {concentration.items.map((_, idx) => (
+                        <Cell key={idx} fill={PIE_COLORS[idx % PIE_COLORS.length]} />
+                      ))}
+                    </Pie>
+                    <Tooltip
+                      formatter={(v) => [formatCurrency(Number(v ?? 0)), "Revenue"]}
+                      contentStyle={{
+                        background: "hsl(var(--card))",
+                        border: "1px solid hsl(var(--border))",
+                        borderRadius: "8px",
+                        fontSize: "11px",
+                      }}
+                    />
+                  </PieChart>
+                </ResponsiveContainer>
+                <div className="space-y-1.5 mt-1">
+                  {concentration.items.map((item, idx) => (
+                    <div key={idx} className="flex items-center justify-between text-xs">
+                      <div className="flex items-center gap-1.5 min-w-0">
+                        <span
+                          className="h-2 w-2 rounded-full shrink-0"
+                          style={{ background: PIE_COLORS[idx % PIE_COLORS.length] }}
+                        />
+                        <span className="truncate text-muted-foreground">{item.name}</span>
+                      </div>
+                      <span className="font-medium tabular-nums shrink-0 ml-2">{item.pct.toFixed(1)}%</span>
+                    </div>
+                  ))}
                 </div>
-              ))}
-            </div>
-          )}
-        </CardContent>
-      </Card>
+              </>
+            )}
+          </CardContent>
+        </Card>
+
+        {/* Recent Activity */}
+        <Card className="lg:col-span-3">
+          <CardHeader>
+            <CardTitle className="text-base">Recent Billing Activity</CardTitle>
+          </CardHeader>
+          <CardContent>
+            {activityLoading ? (
+              <div className="space-y-3">
+                {Array.from({ length: 5 }).map((_, i) => (
+                  <Skeleton key={i} className="h-10 w-full" />
+                ))}
+              </div>
+            ) : !activity?.length ? (
+              <p className="py-8 text-center text-sm text-muted-foreground">
+                No billing activity yet. Create a billing run to get started.
+              </p>
+            ) : (
+              <div className="divide-y divide-border">
+                {activity.map((item) => (
+                  <div key={item.id} className="flex items-center justify-between py-3">
+                    <div>
+                      <p className="text-sm font-medium">{item.title}</p>
+                      <p className="text-xs text-muted-foreground">{formatDate(item.createdAt)}</p>
+                    </div>
+                    <div className="flex items-center gap-4">
+                      <span className="text-sm font-semibold tabular-nums">
+                        {formatCurrency(item.amount, item.currency)}
+                      </span>
+                      <StatusBadge status={item.status} />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      </div>
     </div>
   );
 }

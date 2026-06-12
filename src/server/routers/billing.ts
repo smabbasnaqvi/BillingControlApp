@@ -4,6 +4,7 @@ import { billingPeriods, billingRuns, billingLineItems, contracts, contractLineI
 import { eq, and, desc, isNull, sql } from "drizzle-orm";
 import { TRPCError } from "@trpc/server";
 import { sendApprovalRequestEmail, sendApprovalDecisionEmail } from "@/lib/notifications";
+import { writeAuditLog } from "@/lib/audit";
 
 export const billingRouter = router({
   // ── Billing Periods ──────────────────────────────────────────────────────
@@ -484,17 +485,42 @@ export const billingRouter = router({
         }).catch(console.error);
       }
 
+      await writeAuditLog({
+        tenantId: ctx.tenant.id,
+        userId: ctx.user.id,
+        action: "approve",
+        entityType: "billing_run",
+        entityId: input.id,
+        before: { status: run.status },
+        after: { status: "approved", approvedBy: ctx.user.id },
+      });
+
       return updated;
     }),
 
   reject: protectedProcedure
     .input(z.object({ id: z.string().uuid(), comments: z.string().min(1, "Comments required when rejecting") }))
     .mutation(async ({ ctx, input }) => {
+      const run = await ctx.db.query.billingRuns.findFirst({
+        where: and(eq(billingRuns.id, input.id), eq(billingRuns.tenantId, ctx.tenant.id)),
+      });
+
       const [updated] = await ctx.db
         .update(billingRuns)
         .set({ status: "draft", updatedAt: new Date(), notes: input.comments })
         .where(and(eq(billingRuns.id, input.id), eq(billingRuns.tenantId, ctx.tenant.id)))
         .returning();
+
+      await writeAuditLog({
+        tenantId: ctx.tenant.id,
+        userId: ctx.user.id,
+        action: "reject",
+        entityType: "billing_run",
+        entityId: input.id,
+        before: { status: run?.status },
+        after: { status: "draft", comments: input.comments },
+      });
+
       return updated;
     }),
 

@@ -47,6 +47,7 @@ const NAV_ITEMS = [
     section: "Insights",
     items: [
       { href: "/reports", label: "Reports", icon: BarChart3 },
+      { href: "/settings/audit", label: "Audit Log", icon: Settings },
     ],
   },
 ];

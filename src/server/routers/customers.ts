@@ -3,6 +3,7 @@ import { router, protectedProcedure } from "../trpc";
 import { customers } from "@/db/schema";
 import { eq, and, ilike, desc, or, isNull } from "drizzle-orm";
 import { TRPCError } from "@trpc/server";
+import { writeAuditLog, sanitizeForAudit } from "@/lib/audit";
 
 export const customerSchema = z.object({
   legalName: z.string().min(2, "Legal name must be at least 2 characters"),
@@ -125,6 +126,15 @@ export const customersRouter = router({
       })
       .returning();
 
+    await writeAuditLog({
+      tenantId: ctx.tenant.id,
+      userId: ctx.user.id,
+      action: "create",
+      entityType: "customer",
+      entityId: customer.id,
+      after: sanitizeForAudit(customer as unknown as Record<string, unknown>),
+    });
+
     return customer;
   }),
 
@@ -148,6 +158,16 @@ export const customersRouter = router({
         .set({ ...input.data, updatedAt: new Date() })
         .where(eq(customers.id, input.id))
         .returning();
+
+      await writeAuditLog({
+        tenantId: ctx.tenant.id,
+        userId: ctx.user.id,
+        action: "update",
+        entityType: "customer",
+        entityId: input.id,
+        before: sanitizeForAudit(existing as unknown as Record<string, unknown>),
+        after: sanitizeForAudit(updated as unknown as Record<string, unknown>),
+      });
 
       return updated;
     }),
