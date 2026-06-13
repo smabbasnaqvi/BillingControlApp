@@ -1,26 +1,51 @@
 import { initTRPC, TRPCError } from "@trpc/server";
-import { auth } from "@clerk/nextjs/server";
+import { auth, currentUser } from "@clerk/nextjs/server";
 import { db } from "@/db";
 import { users, tenants } from "@/db/schema";
 import { eq } from "drizzle-orm";
 import { ZodError } from "zod";
 
 export async function createTRPCContext() {
-  const { userId: clerkId, orgId } = await auth();
+  const { userId: clerkId } = await auth();
 
   if (!clerkId) {
-    return { db, user: null, tenant: null };
+    return { db, user: null, tenant: null, clerkId: null };
   }
 
-  const user = await db.query.users.findFirst({
+  let user = await db.query.users.findFirst({
     where: eq(users.clerkId, clerkId),
   });
 
-  const tenant = user
-    ? await db.query.tenants.findFirst({
-        where: eq(tenants.id, user.tenantId),
-      })
-    : null;
+  // Auto-provision tenant + user on first login
+  if (!user) {
+    const clerkUser = await currentUser();
+    if (!clerkUser) return { db, user: null, tenant: null, clerkId };
+
+    const email =
+      clerkUser.emailAddresses?.[0]?.emailAddress ?? `${clerkId}@unknown.com`;
+    const name =
+      [clerkUser.firstName, clerkUser.lastName].filter(Boolean).join(" ") ||
+      email.split("@")[0];
+
+    // Create tenant
+    const slug = `org-${clerkId.slice(-8).toLowerCase()}`;
+    const [newTenant] = await db
+      .insert(tenants)
+      .values({ name: `${name}'s Organization`, slug, plan: "starter", status: "active" })
+      .returning();
+
+    // Create user linked to tenant
+    const [newUser] = await db
+      .insert(users)
+      .values({ clerkId, tenantId: newTenant.id, email, name, status: "active" })
+      .returning();
+
+    user = newUser;
+  }
+
+  const tenant = await db.query.tenants.findFirst({
+    where: eq(tenants.id, user.tenantId),
+  });
 
   return { db, user, tenant, clerkId };
 }
