@@ -14,13 +14,6 @@ export async function createTRPCContext() {
 
   const user = await db.query.users.findFirst({
     where: eq(users.clerkId, clerkId),
-    with: {
-      userRoles: {
-        with: {
-          // role relation included via schema
-        },
-      },
-    },
   });
 
   const tenant = user
