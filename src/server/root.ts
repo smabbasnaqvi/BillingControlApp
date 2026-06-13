@@ -6,6 +6,7 @@ import { billingRouter } from "./routers/billing";
 import { dashboardRouter } from "./routers/dashboard";
 import { workflowRouter } from "./routers/workflow";
 import { reportsRouter } from "./routers/reports";
+import { seedRouter } from "./routers/seed";
 
 export const appRouter = router({
   customers: customersRouter,
@@ -15,6 +16,7 @@ export const appRouter = router({
   dashboard: dashboardRouter,
   workflow: workflowRouter,
   reports: reportsRouter,
+  seed: seedRouter,
 });
 
 export type AppRouter = typeof appRouter;
